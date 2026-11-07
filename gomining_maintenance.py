@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -26,6 +27,12 @@ MONITOR_SLUG = "gomining-daily-maintenance"
 # which on the last attempt of the night could otherwise be ~20 hours away.
 MAX_ATTEMPTS = 3
 RETRY_DELAY_SECONDS = 10
+
+# Set by maintenance.yml: "true" when a failure this run doesn't matter yet
+# (a later run tonight will retry, or today's tap already succeeded). Quiet
+# failures go to Sentry as warnings, which don't email, and skip the cron
+# check-in. Unset (e.g. lock_extend.yml, local runs) means loud, as before.
+TAP_QUIET = os.environ.get("TAP_QUIET", "").strip().lower() == "true"
 
 # GitHub Actions sets this automatically for every run -- no need to
 # hardcode a repo path, which keeps this script portable to any fork.
@@ -261,13 +268,19 @@ def persist_cookies_to_cache(label, context):
             f.write(_fernet().encrypt(json.dumps(payload).encode("utf-8")))
         os.replace(tmp, path)
         print(f"[{label}] cookie store: saved this run's login (encrypted) for the next run.")
-        output_file = os.environ.get("GITHUB_OUTPUT")
-        if output_file:  # tells the workflow's "save cache" step there is something new to save
-            with open(output_file, "a", encoding="utf-8") as f:
-                f.write("cookies_updated=true\n")
+        # tells the workflow's "save cache" step there is something new to save
+        set_github_output("cookies_updated", "true")
     except Exception as exc:  # noqa: BLE001
         print(f"[{label}] WARNING: could not save the login ({type(exc).__name__}) -- "
               "the NEXT run may report a dead session.")
+
+
+def set_github_output(name, value):
+    """Expose a step output to the workflow (no-op outside GitHub Actions)."""
+    output_file = os.environ.get("GITHUB_OUTPUT")
+    if output_file:
+        with open(output_file, "a", encoding="utf-8") as f:
+            f.write(f"{name}={value}\n")
 
 
 def _find_field(node, name, depth=0):
@@ -895,8 +908,362 @@ def extend_locks_for_account(context, label):
             lock_extend_failures.append((label, pid_short, f"{position['amount_gmt']:.2f} GMT"))
 
 
-def report(label, message, level="error"):
-    """Print for the GitHub Actions log, and mirror to Sentry if configured."""
+
+# ---- Optional: reward plan (TH / GOMINING / BTC, alternating or fixed) and pool ----
+#
+# GoMining's reward setting (Settings pop-up on the miners page) sends each day's reward to one
+# of three places: TH on one miner ("TH"), GOMINING tokens in the wallet ("GMT"), or plain BTC
+# (Reinvestment switched off, "BTC"). The pop-up also chooses the mining pool. Per account, this
+# keeps one choice indefinitely or alternates between up to three on a repeating schedule
+# (e.g. 5 days TH, 5 days GOMINING, 3 days BTC), and can hold the pool at a chosen value. Off
+# unless the account has repo Variables (written by the settings page and the setup wizard; the
+# workflow passes all Variables in as GH_VARS):
+#
+#   REWARD_PLAN_<LABEL>       "GMT" (keep one) or "TH:5,GMT:5,BTC:3" (alternate, in that order)
+#   REWARD_START_<LABEL>      YYYY-MM-DD, day 1 of the plan's first stretch; default 2026-01-01
+#   REWARD_TH_MINER_<LABEL>   optional miner number, e.g. 123456; default = biggest listed miner
+#   REWARD_POOL_<LABEL>       optional pool name as GoMining shows it, e.g. "Antpool"
+#
+# v15/v16's REWARD_TH_DAYS_<LABEL> / REWARD_GMT_DAYS_<LABEL> are still read when there's no plan.
+#
+# The day is counted from the start date, never from "the last switch", so a missed night can't
+# shift the cycle. Payouts happen in the US morning, after the whole nightly window, so every
+# run of the night (including the 23:xx UTC one) works for the NEXT payout: the date used is the
+# UTC date one hour from now. Best-effort like the other extras: a problem is a Sentry warning,
+# never a failed tap. The page itself is driven (not the API) so the account's other settings
+# (maintenance in GOMINING, reward protection) are left exactly as they are.
+REWARD_SETTINGS_URL = DASHBOARD_URL + "?modal=reward-settings"
+REWARD_SAVE_PATH = "/api/user/change-incomes-settings"
+REWARD_DEFAULT_START = "2026-01-01"
+REWARD_MAX_DAYS = 365
+REWARD_MODES = ("TH", "GMT", "BTC")
+REWARD_MODE_NAMES = {"TH": "TH", "GMT": "GOMINING", "BTC": "BTC"}
+REINVEST_SWITCH = "input[name=rewards-settings-reinvestment-nft-power]"
+REINVEST_RADIO = "input[name=reinvestment][value={}]"  # "token" = GOMINING, "nft" = TH
+MINER_PICKER = "rewards-settings-reinvestment-nft-power"
+
+
+def _repo_vars():
+    """The repo's Actions Variables (GH_VARS = toJSON(vars) in the workflow), or {}."""
+    try:
+        data = json.loads(os.environ.get("GH_VARS") or "{}")
+        return data if isinstance(data, dict) else {}
+    except ValueError:
+        return {}
+
+
+def parse_reward_plan(raw, key="LABEL"):
+    """[(mode, days), ...] from "GMT" or "TH:5,GMT:5,BTC:3"; ValueError with a plain reason.
+
+    One entry = keep that choice (its days don't matter). Two or three entries alternate in the
+    order given; each mode at most once.
+    """
+    parts = [p.strip().upper() for p in raw.split(",") if p.strip()]
+    if not 1 <= len(parts) <= 3:
+        raise ValueError(f"REWARD_PLAN_{key} needs one to three choices, like GMT or TH:5,GMT:5.")
+    plan = []
+    for part in parts:
+        m = re.fullmatch(r"(TH|GMT|BTC)(?::(\d{1,3}))?", part)
+        if not m:
+            raise ValueError(f"REWARD_PLAN_{key}: {part!r} isn't TH, GMT or BTC with a number of days (like GMT:5).")
+        days = int(m.group(2)) if m.group(2) else (1 if len(parts) == 1 else 0)
+        if not 1 <= days <= REWARD_MAX_DAYS:
+            raise ValueError(f"REWARD_PLAN_{key}: {part!r} needs a number of days from 1 to {REWARD_MAX_DAYS}.")
+        plan.append((m.group(1), days))
+    if len({mode for mode, _ in plan}) != len(plan):
+        raise ValueError(f"REWARD_PLAN_{key} lists the same choice twice.")
+    return plan
+
+
+def reward_rotation_config(label, variables=None):
+    """This account's reward settings, None when none are set, or ValueError with a plain reason.
+
+    Returns {"plan": [(mode, days)...] (may be empty: pool only), "start" (date),
+    "miner" (digits or None), "pool" (str or None)}. A plain environment variable of the same
+    name wins over the repo Variable (handy for local runs).
+    """
+    variables = _repo_vars() if variables is None else variables
+    key = label.upper()
+
+    def get(name):
+        value = os.environ.get(f"{name}_{key}")
+        if value is None:
+            value = variables.get(f"{name}_{key}")
+        return str(value).strip() if value is not None else ""
+
+    plan_raw, pool = get("REWARD_PLAN"), get("REWARD_POOL")
+    th_raw, gmt_raw = get("REWARD_TH_DAYS"), get("REWARD_GMT_DAYS")
+    if plan_raw:
+        plan = parse_reward_plan(plan_raw, key)
+    elif th_raw or gmt_raw:  # the v15/v16 format
+        days = []
+        for name, raw in (("REWARD_TH_DAYS", th_raw), ("REWARD_GMT_DAYS", gmt_raw)):
+            raw = raw or "0"
+            if not re.fullmatch(r"\d{1,3}", raw) or int(raw) > REWARD_MAX_DAYS:
+                raise ValueError(f"{name}_{key} must be a whole number of days from 0 to {REWARD_MAX_DAYS}, not {raw!r}.")
+            days.append(int(raw))
+        if days == [0, 0]:
+            raise ValueError(f"REWARD_TH_DAYS_{key} and REWARD_GMT_DAYS_{key} can't both be 0 "
+                             "(clear both to turn the rotation off).")
+        plan = [(mode, d) for mode, d in zip(("TH", "GMT"), days) if d]
+    else:
+        plan = []
+    if not plan and not pool:
+        return None
+    if len(pool) > 40 or (pool and not re.fullmatch(r"[A-Za-z0-9 ()._-]+", pool)):
+        raise ValueError(f"REWARD_POOL_{key} should be a pool name as GoMining shows it, like Antpool.")
+    start_raw = get("REWARD_START") or REWARD_DEFAULT_START
+    try:
+        start = datetime.strptime(start_raw, "%Y-%m-%d").date()
+    except ValueError:
+        raise ValueError(f"REWARD_START_{key} must be a date like 2026-11-05, not {start_raw!r}.") from None
+    miner_raw = get("REWARD_TH_MINER").lstrip("#").strip()
+    if miner_raw and not re.fullmatch(r"\d{1,12}", miner_raw):
+        raise ValueError(f"REWARD_TH_MINER_{key} must be a miner number like 123456, not {miner_raw!r}.")
+    return {"plan": plan, "start": start, "miner": miner_raw or None, "pool": pool or None}
+
+
+def reward_mode_for(day, plan, start):
+    """(mode, day number within that stretch, length of that stretch) for `day`.
+
+    A one-entry plan is that mode every day, reported as (mode, 1, 1).
+    """
+    if len(plan) == 1:
+        return plan[0][0], 1, 1
+    position = (day - start).days % sum(d for _, d in plan)  # Python's % is never negative
+    for mode, days in plan:
+        if position < days:
+            return mode, position + 1, days
+        position -= days
+    raise AssertionError("unreachable")
+
+
+def reward_day(now=None):
+    """The date whose payout tonight's runs are setting up (see the section comment)."""
+    now = now or datetime.now(timezone.utc)
+    return (now + timedelta(hours=1)).date()
+
+
+def choose_miner_option(option_texts, wanted=None):
+    """(index, note) of the miner to send TH to, from the picker's option texts, or (None, why).
+
+    `wanted` is a miner number ("123456"). Without one, or if it isn't offered, the option
+    with the most TH wins (the first one on a tie or when no TH figure can be read).
+    """
+    if not option_texts:
+        return None, "GoMining offered no miners to send TH to"
+    numbers = [re.search(r"#\s*(\d+)", t or "") for t in option_texts]
+    if wanted:
+        for i, m in enumerate(numbers):
+            if m and m.group(1) == wanted:
+                return i, "the miner you chose"
+
+    def th_of(text):
+        m = re.search(r"(\d+(?:[.,]\d+)?)\s*TH\b", text or "")
+        return float(m.group(1).replace(",", ".")) if m else -1.0
+
+    sizes = [th_of(t) for t in option_texts]
+    best = max(range(len(option_texts)), key=lambda i: (sizes[i], -i))
+    if wanted:
+        return best, f"the biggest listed miner (miner #{wanted} isn't in GoMining's list)"
+    return best, "the biggest listed miner"
+
+
+POOL_PICKER = "rewards-settings-pool ng-select#pools"
+REWARD_PASSES = 3     # open -> read -> correct -> re-check; GoMining sometimes needs a second go
+REWARD_SETTLE_MS = 2500
+
+
+def reward_state_matches(state, want, miner=None, pool=None):
+    """True when the pop-up's state (from _read_reward_state) already gives `want` (+ miner, pool)."""
+    if pool and (state.get("pool") or "").lower() != pool.lower():
+        return False
+    if want is None:
+        return True
+    if want == "BTC":
+        return state.get("reinvest") is False
+    if not state.get("reinvest"):
+        return False
+    if want == "GMT":
+        return state.get("choice") == "GMT"
+    return state.get("choice") == "TH" and (not miner or state.get("miner") == miner)
+
+
+def _read_reward_state(page):
+    """{"reinvest": bool, "choice": "TH"/"GMT"/None, "miner": digits or "", "pool": name or ""}.
+
+    While Reinvestment is off GoMining doesn't render the TH/GOMINING choices at all.
+    """
+    page.locator(REINVEST_SWITCH).wait_for(state="attached", timeout=30000)
+    page.wait_for_timeout(REWARD_SETTLE_MS)  # let the saved settings load into the controls
+    state = {"reinvest": page.locator(REINVEST_SWITCH).is_checked(), "choice": None, "miner": "", "pool": ""}
+    try:
+        state["pool"] = page.locator(f"{POOL_PICKER} .ng-value").first.inner_text(timeout=5000).strip()
+    except PlaywrightTimeoutError:
+        pass
+    if state["reinvest"]:
+        page.locator(REINVEST_RADIO.format("token")).wait_for(state="attached", timeout=10000)
+        if page.locator(REINVEST_RADIO.format("nft")).is_checked():
+            state["choice"] = "TH"
+            state["miner"] = _selected_miner_number(page.locator(MINER_PICKER))
+        elif page.locator(REINVEST_RADIO.format("token")).is_checked():
+            state["choice"] = "GMT"
+    return state
+
+
+def _selected_miner_number(picker):
+    """The number of the miner shown as getting TH ("" if none can be read in a few seconds).
+
+    GoMining fills it in a moment after the pop-up opens; a live run once timed out reading
+    it straight away.
+    """
+    try:
+        chosen = picker.locator(".ng-value").first
+        chosen.wait_for(state="visible", timeout=8000)
+        m = re.search(r"#\s*(\d+)", chosen.inner_text(timeout=3000))
+        return m.group(1) if m else ""
+    except PlaywrightTimeoutError:
+        return ""
+
+
+def _pick_from_dropdown(page, picker_selector, choose):
+    """Open an ng-select and click the option `choose(option_texts)` returns (index, note).
+
+    Returns the note, or raises LookupError with the note when nothing suitable is offered.
+    """
+    options = page.locator(f"{picker_selector} .ng-option")
+    for _ in range(2):  # a click can land while the list is still settling; try twice
+        page.locator(f"{picker_selector} .ng-select-container").first.click(timeout=10000)
+        try:
+            options.first.wait_for(state="visible", timeout=5000)
+            break
+        except PlaywrightTimeoutError:
+            continue
+    options.first.wait_for(state="visible", timeout=5000)
+    index, note = choose(options.all_inner_texts())
+    if index is None:
+        page.keyboard.press("Escape")
+        raise LookupError(note)
+    options.nth(index).click()
+    page.wait_for_timeout(REWARD_SETTLE_MS)
+    return note
+
+
+def choose_pool_option(option_texts, wanted):
+    """(index, note) of the pool named `wanted` (case-insensitive, by its leading name), or (None, why)."""
+    for i, text in enumerate(option_texts):
+        name = (text or "").strip().split()[0] if (text or "").strip() else ""
+        if name.lower() == wanted.lower():
+            return i, wanted
+    offered = ", ".join((t or "").strip().split()[0] for t in option_texts if (t or "").strip())
+    return None, f"GoMining doesn't offer a pool called {wanted!r} (it offers: {offered or 'none'})"
+
+
+def _correct_reward_state(page, state, want, config):
+    """Make one round of changes towards `want`. Returns plain notes on what was changed."""
+    notes = []
+    click = lambda selector: (page.locator(selector).first.click(timeout=10000), page.wait_for_timeout(REWARD_SETTLE_MS))
+    switch = f"label:has({REINVEST_SWITCH})"
+    th_label = f"label:has({REINVEST_RADIO.format('nft')})"
+    gmt_label = f"label:has({REINVEST_RADIO.format('token')})"
+
+    if config["pool"] and state["pool"].lower() != config["pool"].lower():
+        _pick_from_dropdown(page, POOL_PICKER, lambda texts: choose_pool_option(texts, config["pool"]))
+        notes.append(f"pool -> {config['pool']}")
+    if want is None:
+        return notes
+    if want == "BTC":
+        if state["reinvest"]:
+            click(switch)
+            notes.append("Reinvestment off (BTC)")
+        return notes
+    if not state["reinvest"]:
+        # Turning Reinvestment back on can leave GoMining half-set (seen live: "no miner, not
+        # GOMINING" while the page shows GOMINING), so always follow it with an explicit choice.
+        click(switch)
+        page.locator(REINVEST_RADIO.format("token")).wait_for(state="attached", timeout=10000)
+        click(th_label)
+        notes.append("Reinvestment on")
+        state = {"reinvest": True, "choice": "TH" if page.locator(REINVEST_RADIO.format("nft")).is_checked() else "GMT",
+                 "miner": "", "pool": state["pool"]}
+    if want == "GMT":
+        if state["choice"] != "GMT" or "Reinvestment on" in notes:
+            click(gmt_label)
+            notes.append("GOMINING")
+        return notes
+    if state["choice"] != "TH":
+        click(th_label)
+    if not page.locator(REINVEST_RADIO.format("nft")).is_checked():
+        return notes + ["TH didn't stick yet"]
+    current_miner = _selected_miner_number(page.locator(MINER_PICKER))
+    if not current_miner or (config["miner"] and current_miner != config["miner"]):
+        note = _pick_from_dropdown(page, MINER_PICKER, lambda texts: choose_miner_option(texts, config["miner"]))
+        notes.append(f"TH on {note}")
+    else:
+        notes.append("TH")
+    return notes
+
+
+def apply_reward_rotation(context, label):
+    """Make the account's reward destination and pool match its plan for today. Never raises.
+
+    Each pass opens the Settings pop-up fresh, reads what GoMining actually has saved, and makes
+    one round of corrections; the next pass checks the result. GoMining's own save requests
+    weren't a reliable signal (some choices save twice, some show before they save), so a fresh
+    read is the only thing trusted.
+    """
+    try:
+        config = reward_rotation_config(label)
+    except ValueError as exc:
+        report(label, f"reward settings skipped -- {exc}", level="warning")
+        return
+    if not config:
+        return
+    want, where = None, "pool only"
+    if config["plan"]:
+        want, n, length = reward_mode_for(reward_day(), config["plan"], config["start"])
+        name = REWARD_MODE_NAMES[want]
+        where = f"always {name}" if len(config["plan"]) == 1 else f"day {n} of {length} on {name}"
+    page = None
+    step = "opening the Settings pop-up"
+    changes = []
+    try:
+        page = context.new_page()
+        for attempt in range(1, REWARD_PASSES + 1):
+            step = "opening the Settings pop-up"
+            page.goto(REWARD_SETTINGS_URL, wait_until="domcontentloaded", timeout=30000)
+            step = "reading the current settings"
+            state = _read_reward_state(page)
+            if reward_state_matches(state, want, config["miner"], config["pool"]):
+                done = f"changed: {', '.join(changes)}" if changes else "already set"
+                print(f"[{label}] reward settings: {where} -- {done}.")
+                return
+            if attempt == REWARD_PASSES:
+                break
+            step = "changing the settings"
+            changes += _correct_reward_state(page, state, want, config)
+        report(label, f"reward settings: {where} -- GoMining still doesn't show the wanted setting after "
+                      f"{REWARD_PASSES - 1} tries (changed: {', '.join(changes) or 'nothing'}).", level="warning")
+    except LookupError as exc:
+        report(label, f"reward settings: {where} -- {exc}.", level="warning")
+    except Exception as exc:
+        report(label, f"reward settings failed while {step} ({type(exc).__name__}); the tap is unaffected.",
+               level="warning")
+    finally:
+        if page is not None:
+            try:
+                page.close()
+            except Exception:
+                pass
+
+
+def report(label, message, level="error", loud=False):
+    """Print for the GitHub Actions log, and mirror to Sentry if configured.
+
+    In a quiet run (TAP_QUIET) errors are sent as warnings unless `loud`.
+    """
+    if TAP_QUIET and level == "error" and not loud:
+        level = "warning"
     print(f"[{label}] {'FAILED' if level == 'error' else 'WARNING'}: {message}")
     if SENTRY_DSN:
         with sentry_sdk.new_scope() as scope:
@@ -970,9 +1337,11 @@ def run_for_account(playwright, label, env_var, cookies_json):
                         # so return now instead of burning the rest.
                         # report() mirrors this to Sentry, where an alert
                         # rule turns it into an email.
+                        # Always loud, even in a quiet run: retrying can't fix it.
                         report(label, "session expired -- GoMining served its guest / "
                                       "signup page instead of the dashboard. Re-capture "
-                                      "cookies (capture-cookies skill).")
+                                      "cookies (capture-cookies skill).", loud=True)
+                        set_github_output("session_expired", "true")
                         return False
                     raise  # genuine load failure -- let the retry loop handle it
 
@@ -1036,6 +1405,8 @@ def run_for_account(playwright, label, env_var, cookies_json):
                 read_lock_model_on_fresh_page(context, label)
             if RUN_LOCK_EXTEND:
                 extend_locks_for_account(context, label)
+            else:
+                apply_reward_rotation(context, label)
             if COOKIE_STORE == "cache":
                 persist_cookies_to_cache(label, context)
             else:
@@ -1044,34 +1415,50 @@ def run_for_account(playwright, label, env_var, cookies_json):
         browser.close()
 
 
+# Sentry's cron monitor answers one question: did a tap succeed today?
+# It expects ONE check-in per UTC day, any time between the 00:00 UTC reset
+# and 09:00 UTC (5am ET), which leaves the last scheduled run (05:15, which
+# GitHub has been starting as late as ~07:30) time to finish. No OK by then
+# means a missed day, and Sentry opens an issue (which emails). This is also
+# what catches GitHub never starting the last-chance run at all.
+#
+# One check-in per run, sent at the end (no IN_PROGRESS first, so a quiet
+# failure can simply send nothing). Runs at 23:xx UTC, before the reset,
+# never check in: their tap counts for the previous day. Nor does the
+# weekly lock job (RUN_LOCK_EXTEND), which isn't part of the nightly window.
+MONITOR_CONFIG = {
+    "schedule": {"type": "crontab", "value": "0 0 * * *"},
+    "timezone": "UTC",
+    "checkin_margin": 540,
+    "max_runtime": 10,
+    "failure_issue_threshold": 1,
+    "recovery_threshold": 1,
+}
+
+
+def monitor_checkin(ok, started):
+    """Send this run's cron check-in to Sentry, if this run should send one."""
+    if not SENTRY_DSN or RUN_LOCK_EXTEND or datetime.now(timezone.utc).hour == 23:
+        return
+    if not ok and TAP_QUIET:
+        return  # a later run will retry; if none succeeds, Sentry flags the missed day
+    capture_checkin(
+        monitor_slug=MONITOR_SLUG,
+        status=MonitorStatus.OK if ok else MonitorStatus.ERROR,
+        duration=time.monotonic() - started,
+        monitor_config=MONITOR_CONFIG,
+    )
+
+
 def main():
-    check_in_id = None
-    if SENTRY_DSN:
-        check_in_id = capture_checkin(
-            monitor_slug=MONITOR_SLUG,
-            status=MonitorStatus.IN_PROGRESS,
-            monitor_config={
-                # Mirrors .github/workflows/maintenance.yml's cron exactly.
-                "schedule": {"type": "crontab", "value": "15 23,0-5 * * *"},
-                "timezone": "UTC",
-                # GitHub's scheduler is best-effort and we've directly
-                # observed 45+ min delays -- this must stay looser than
-                # that or Sentry will cry wolf on normal lag.
-                "checkin_margin": 60,
-                # Retries can now push a real run close to the job-level
-                # timeout (see maintenance.yml); keep headroom above that.
-                "max_runtime": 8,
-                "failure_issue_threshold": 1,
-                "recovery_threshold": 1,
-            },
-        )
+    started = time.monotonic()
 
     if not ACCOUNTS:
         msg = "no accounts configured. Set GOMINING_ACCOUNT_LABELS (comma-separated, e.g. \"PRIMARY,SECONDARY\") in the workflow env."
         print(f"FAILED: {msg}")
         if SENTRY_DSN:
             sentry_sdk.capture_message(msg, level="error")
-            capture_checkin(monitor_slug=MONITOR_SLUG, check_in_id=check_in_id, status=MonitorStatus.ERROR)
+            monitor_checkin(False, started)
             sentry_sdk.flush()
         sys.exit(1)
 
@@ -1080,7 +1467,7 @@ def main():
         print(f"FAILED: {store_error}")
         if SENTRY_DSN:
             sentry_sdk.capture_message(store_error, level="error")
-            capture_checkin(monitor_slug=MONITOR_SLUG, check_in_id=check_in_id, status=MonitorStatus.ERROR)
+            monitor_checkin(False, started)
             sentry_sdk.flush()
         sys.exit(1)
 
@@ -1118,11 +1505,7 @@ def main():
     overall_ok = all(results.values()) and not lock_extend_failures
 
     if SENTRY_DSN:
-        capture_checkin(
-            monitor_slug=MONITOR_SLUG,
-            check_in_id=check_in_id,
-            status=MonitorStatus.OK if overall_ok else MonitorStatus.ERROR,
-        )
+        monitor_checkin(overall_ok, started)
         sentry_sdk.flush()
 
     if not overall_ok:
